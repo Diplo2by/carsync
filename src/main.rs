@@ -68,6 +68,36 @@ fn sync_directory(args: &Args) -> Result<()> {
 
         sync_file(source_file, &dest_file)?;
     }
+    if args.delete && args.destination.exists() {
+        delete_extra_files(args)?;
+    }
+
+    Ok(())
+}
+
+fn delete_extra_files(args: &Args) -> Result<()> {
+    let dest_files: Vec<PathBuf> = WalkDir::new(&args.destination)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    for dest_file in dest_files {
+        let relative_path = dest_file.strip_prefix(&args.destination)?;
+        let source_file = args.source.join(relative_path);
+
+        if !source_file.exists() {
+            if args.verbose || args.dry_run {
+                println!("Deleting: {}", dest_file.display());
+            }
+
+            if !args.dry_run {
+                fs::remove_file(&dest_file)?;
+                println!("removed file {:?}", dest_file);
+            }
+        }
+    }
 
     Ok(())
 }
