@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use anyhow::{Context, Ok, Result, bail};
@@ -9,6 +10,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use walkdir::WalkDir;
+use rayon::prelude::*;
+use memmap2::Mmap;
 
 #[derive(Parser, Debug)]
 #[command(name = "carsync")]
@@ -51,6 +54,13 @@ impl SyncStats {
         }
     }
 
+    fn merge(&mut self, other: &SyncStats) {
+        self.files_copied += other.files_copied;
+        self.files_skipped += other.files_skipped;
+        self.files_deleted += other.files_deleted;
+        self.bytes_transferred += other.bytes_transferred;
+    }
+
     fn print_summary(&self) {
         println!("\n🐱 Sync Summary:");
         println!("  Files copied: {}", self.files_copied);
@@ -62,6 +72,7 @@ impl SyncStats {
         );
     }
 }
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -103,13 +114,15 @@ fn sync_file(args: &Args, source: &Path, destination: &Path, stats: &mut SyncSta
         !metadata_match(source, destination)?
     };
 
-    if should_copy && !args.dry_run {
-        fs::copy(source, destination)?;
-        let size = fs::metadata(source)?.len();
-        stats.files_copied += 1;
-        stats.bytes_transferred += size;
+    if should_copy {
+        if !args.dry_run {
+            fs::copy(source, destination)?;
+            let size = fs::metadata(source)?.len();
+            stats.files_copied += 1;
+            stats.bytes_transferred += size;
+        }
     } else {
-        stats.files_deleted += 1;
+        stats.files_skipped += 1;
     }
 
     Ok(())
@@ -127,6 +140,20 @@ fn sync_directory(args: &Args, stats: &mut SyncStats) -> Result<()> {
         .map(|e| e.path().to_path_buf())
         .collect();
 
+    if !args.dry_run {
+        let dirs: std::collections::HashSet<PathBuf> = source_files
+            .iter()
+            .filter_map(|f| {
+                f.strip_prefix(&args.source).ok()
+                    .and_then(|rel| args.destination.join(rel).parent().map(|p| p.to_path_buf()))
+            })
+            .collect();
+        
+        for dir in dirs {
+            fs::create_dir_all(dir)?;
+        }
+    }
+
     let pb = ProgressBar::new(source_files.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -134,13 +161,42 @@ fn sync_directory(args: &Args, stats: &mut SyncStats) -> Result<()> {
             .unwrap()
             .progress_chars("🐾🐾"),
     );
-    for source_file in &source_files {
+
+    let stats_mutex = Mutex::new(SyncStats::new());
+
+    source_files.par_iter().try_for_each(|source_file| -> Result<()> {
         let relative_path = source_file.strip_prefix(&args.source)?;
         let dest_file = args.destination.join(relative_path);
 
-        sync_file(args, source_file, &dest_file, stats)?;
+        let mut local_stats = SyncStats::new();
+        
+        let should_copy = if !dest_file.exists() {
+            true
+        } else if args.checksum {
+            !checksums_match(source_file, &dest_file)?
+        } else {
+            !metadata_match(source_file, &dest_file)?
+        };
+
+        if should_copy {
+            if !args.dry_run {
+                fs::copy(source_file, &dest_file)?;
+                let size = fs::metadata(source_file)?.len();
+                local_stats.files_copied += 1;
+                local_stats.bytes_transferred += size;
+            }
+        } else {
+            local_stats.files_skipped += 1;
+        }
+        
+        let mut stats = stats_mutex.lock().unwrap();
+        stats.merge(&local_stats);
+        
         pb.inc(1);
-    }
+        Ok(())
+    })?;
+
+    *stats = stats_mutex.into_inner().unwrap();
 
     if args.delete && args.destination.exists() {
         delete_extra_files(args, stats)?;
@@ -169,7 +225,6 @@ fn delete_extra_files(args: &Args, stats: &mut SyncStats) -> Result<()> {
 
             if !args.dry_run {
                 fs::remove_file(&dest_file)?;
-                println!("removed file {:?}", dest_file);
                 stats.files_deleted += 1;
             }
         }
@@ -182,7 +237,11 @@ fn metadata_match(source: &Path, destination: &Path) -> Result<bool> {
     let source_meta = fs::metadata(source)?;
     let dest_meta = fs::metadata(destination)?;
 
-    Ok(source_meta.len() == dest_meta.len() && source_meta.modified()? <= dest_meta.modified()?)
+    if source_meta.len() != dest_meta.len() {
+        return Ok(false);
+    }
+
+    Ok(source_meta.modified()? <= dest_meta.modified()?)
 }
 
 fn checksums_match(source: &Path, destination: &Path) -> Result<bool> {
@@ -192,19 +251,28 @@ fn checksums_match(source: &Path, destination: &Path) -> Result<bool> {
 }
 
 fn calculate_checksum(path: &Path) -> Result<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 8192];
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    
+    if metadata.len() > 1_048_576 {
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mut hasher = Sha256::new();
+        hasher.update(&mmap);
+        Ok(hasher.finalize().to_vec())
+    } else {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; 65536]; 
+        let mut file = file;
 
-    loop {
-        let bytes_read = file.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
         }
-        hasher.update(&buffer[..bytes_read]);
+        Ok(hasher.finalize().to_vec())
     }
-
-    Ok(hasher.finalize().to_vec())
 }
 
 fn format_bytes(bytes: u64) -> String {
