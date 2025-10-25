@@ -62,97 +62,6 @@ impl SyncStats {
         );
     }
 }
-
-fn create_cat_progress_bar(total: u64, style: &str) -> ProgressBar {
-    let pb = ProgressBar::new(total);
-
-    match style {
-        "running" => {
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template(
-                        "{spinner} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len}\n  {msg}",
-                    )
-                    .unwrap()
-                    .progress_chars("🐱💨>-")
-                    .tick_strings(&[
-                        "  /\\_/\\   ",
-                        " ( o.o ) ~>",
-                        "  > ^ <   ",
-                        "    /\\_/\\  ",
-                        "   ( ^.^ )~>",
-                        "    > ^ <  ",
-                    ]),
-            );
-        }
-        "chasing" => {
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template(
-                        "{spinner} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len}\n  {msg}",
-                    )
-                    .unwrap()
-                    .progress_chars("🐱🐁>-")
-                    .tick_strings(&[
-                        "🐱        🐁",
-                        " 🐱       🐁",
-                        "  🐱      🐁",
-                        "   🐱     🐁",
-                        "    🐱    🐁",
-                        "     🐱   🐁",
-                        "      🐱  🐁",
-                        "       🐱 🐁",
-                        "        🐱🐁",
-                    ]),
-            );
-        }
-        _ => {
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{spinner} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-                    .unwrap()
-                    .progress_chars("😺😸😻")
-                    .tick_strings(&["🐱", "😺", "😸", "😻", "😽"]),
-            );
-        }
-    }
-
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb
-}
-
-fn get_cat_frames() -> Vec<&'static str> {
-    vec![
-        r#"
-   /\_/\  
-  ( o.o ) ~>
-   > ^ 
-  /|   |\
- (_|   |_)
-"#,
-        r#"
-   /\_/\  
-  ( ^.^ ) ~>
-   > ^ 
-   |   |
-  /|   |\
-"#,
-        r#"
-   /\_/\  
-  ( o.o ) ~>
-   > ^ 
-  /     \
- /_|   |_\
-"#,
-        r#"
-   /\_/\  
-  ( ^.^ ) ~>
-   > ^ 
-   |   |
-  _|   |_
-"#,
-    ]
-}
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -218,47 +127,25 @@ fn sync_directory(args: &Args, stats: &mut SyncStats) -> Result<()> {
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    let pb = if !args.verbose {
-        let pb = ProgressBar::new(source_files.len() as u64);
-
-        // Cat-themed progress bar styles
-        let cat_chars = get_cat_progress_chars("running");
-
-        // Option 1: Simple emoji cat running
-        let style = ProgressStyle::default_bar()
-            .template(&format!("{{spinner}} [{{elapsed_precise}}] {{bar:40.cyan/blue}} {{pos}}/{{len}} {{msg}}\n  🐱 {{wide_msg}}"))
+    let pb = ProgressBar::new(source_files.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner} [{bar:100}] {pos}/{len} files")
             .unwrap()
-            .progress_chars(cat_chars)
-            .tick_strings(&["🐱", "😺", "😸", "😻", "😽", "🐈"]);
-
-        pb.set_style(style);
-        pb.enable_steady_tick(std::time::Duration::from_millis(120));
-        Some(pb)
-    } else {
-        None
-    };
-
+            .progress_chars("🐾🐾"),
+    );
     for source_file in &source_files {
         let relative_path = source_file.strip_prefix(&args.source)?;
         let dest_file = args.destination.join(relative_path);
 
-        if let Some(ref pb) = pb {
-            pb.set_message(format!("{}", relative_path.display()))
-        }
-
         sync_file(args, source_file, &dest_file, stats)?;
-        if let Some(ref pb) = pb {
-            pb.inc(1);
-        }
-    }
-
-    if let Some(pb) = pb {
-        pb.finish_with_message("Done");
+        pb.inc(1);
     }
 
     if args.delete && args.destination.exists() {
         delete_extra_files(args, stats)?;
     }
+    pb.finish();
 
     Ok(())
 }
@@ -331,13 +218,4 @@ fn format_bytes(bytes: u64) -> String {
     }
 
     format!("{:.2} {}", size, UNITS[unit_index])
-}
-fn get_cat_progress_chars(style: &str) -> &'static str {
-    match style {
-        "running" => "🐱💨",
-        "walking" => "🐱🐾",
-        "sliding" => "😺💨",
-        "chasing" => "🐱🐁",
-        _ => "🐱💨",
-    }
 }
