@@ -2,6 +2,14 @@
 name = "carsync"
 version = "0.1.0"
 edition = "2024"
+authors = ["Diplo2by <contactdarshanv@gmail.com>"]
+description = "CarSync - rsync with cars!"
+readme = "README.md"
+license = "GPL-3.0"
+keywords = ["rsync", "sync", "files", "cli", "backup"]
+categories = ["command-line-utilities", "filesystem"]
+repository = "https://github.com/Diplo2by/carsync"
+homepage = "https://github.com/Diplo2by/carsync"
 
 [dependencies]
 anyhow = "1.0.100"
