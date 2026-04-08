@@ -1,8 +1,9 @@
 use std::{
     fs,
-    io::{self, BufReader, BufWriter, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Ok, Result, bail};
@@ -11,7 +12,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::io::Read;
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
@@ -39,6 +39,13 @@ struct Args {
 
     #[arg(short, long, help = "Compare files by checksum (sniff carefully)")]
     checksum: bool,
+
+    #[arg(
+        short = 'd',
+        long,
+        help = "Use delta transfer for changed files (only changed chunks hitch a ride)"
+    )]
+    delta: bool,
 
     #[arg(
         short = 'z',
@@ -180,8 +187,13 @@ fn sync_file(args: &Args, source: &Path, destination: &Path, stats: &mut SyncSta
 
     if should_copy {
         if !args.dry_run {
-            let (size, wire_bytes) =
-                transfer_file(source, destination, args.compress, args.compression_level)?;
+            let (size, wire_bytes) = transfer_file(
+                source,
+                destination,
+                args.delta,
+                args.compress,
+                args.compression_level,
+            )?;
             stats.files_copied += 1;
             stats.bytes_transferred += size;
             stats.bytes_on_wire += wire_bytes;
@@ -261,6 +273,7 @@ fn sync_directory(args: &Args, stats: &mut SyncStats) -> Result<()> {
                     let (size, wire_bytes) = transfer_file(
                         source_file,
                         &dest_file,
+                        args.delta,
                         args.compress,
                         args.compression_level,
                     )?;
@@ -378,10 +391,13 @@ fn format_bytes(bytes: u64) -> String {
 fn transfer_file(
     source: &Path,
     destination: &Path,
+    use_delta: bool,
     use_compression: bool,
     compression_level: i32,
 ) -> Result<(u64, u64)> {
-    if use_compression {
+    if use_delta && destination.exists() {
+        transfer_with_delta(source, destination)
+    } else if use_compression {
         transfer_with_compression(source, destination, compression_level)
     } else {
         fs::copy(source, destination)?;
@@ -395,7 +411,8 @@ fn transfer_with_compression(
     destination: &Path,
     compression_level: i32,
 ) -> Result<(u64, u64)> {
-    let source_size = fs::metadata(source)?.len();
+    let source_meta = fs::metadata(source)?;
+    let source_size = source_meta.len();
 
     let source_file =
         fs::File::open(source).with_context(|| format!("Failed to open source {:?}", source))?;
@@ -416,6 +433,109 @@ fn transfer_with_compression(
     io::copy(&mut decoder, &mut destination_writer)
         .context("Failed to write decompressed content")?;
     destination_writer.flush()?;
+    fs::set_permissions(destination, source_meta.permissions())?;
 
     Ok((source_size, compressed_size))
+}
+
+const DELTA_CHUNK_SIZE: usize = 64 * 1024;
+
+fn transfer_with_delta(source: &Path, destination: &Path) -> Result<(u64, u64)> {
+    let source_meta = fs::metadata(source)?;
+    let source_size = source_meta.len();
+
+    let signatures = build_destination_signatures(destination)?;
+    let destination_file = fs::File::open(destination)
+        .with_context(|| format!("Failed to open destination {:?}", destination))?;
+    let mut destination_reader = BufReader::new(destination_file);
+
+    let source_file =
+        fs::File::open(source).with_context(|| format!("Failed to open source {:?}", source))?;
+    let mut source_reader = BufReader::new(source_file);
+
+    let tmp_path = temp_output_path(destination);
+    let tmp_file = fs::File::create(&tmp_path)
+        .with_context(|| format!("Failed to create temp output {:?}", tmp_path))?;
+    let mut tmp_writer = BufWriter::new(tmp_file);
+
+    let mut buffer = vec![0_u8; DELTA_CHUNK_SIZE];
+    let mut bytes_on_wire = 0_u64;
+
+    loop {
+        let read_len = source_reader.read(&mut buffer)?;
+        if read_len == 0 {
+            break;
+        }
+
+        let chunk = &buffer[..read_len];
+        let hash = sha256_chunk(chunk);
+
+        if let Some(sig) = signatures
+            .get(&hash)
+            .and_then(|items| items.iter().find(|sig| sig.length == read_len))
+        {
+            destination_reader.seek(SeekFrom::Start(sig.offset))?;
+            let mut match_buf = vec![0_u8; read_len];
+            destination_reader.read_exact(&mut match_buf)?;
+            tmp_writer.write_all(&match_buf)?;
+        } else {
+            tmp_writer.write_all(chunk)?;
+            bytes_on_wire += read_len as u64;
+        }
+    }
+
+    tmp_writer.flush()?;
+    fs::rename(&tmp_path, destination)?;
+    fs::set_permissions(destination, source_meta.permissions())?;
+
+    Ok((source_size, bytes_on_wire))
+}
+
+#[derive(Debug)]
+struct BlockSignature {
+    offset: u64,
+    length: usize,
+}
+
+fn build_destination_signatures(
+    destination: &Path,
+) -> Result<std::collections::HashMap<[u8; 32], Vec<BlockSignature>>> {
+    let file = fs::File::open(destination)
+        .with_context(|| format!("Failed to open destination {:?}", destination))?;
+    let mut reader = BufReader::new(file);
+    let mut signatures = std::collections::HashMap::<[u8; 32], Vec<BlockSignature>>::new();
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; DELTA_CHUNK_SIZE];
+
+    loop {
+        let read_len = reader.read(&mut buffer)?;
+        if read_len == 0 {
+            break;
+        }
+
+        let hash = sha256_chunk(&buffer[..read_len]);
+        signatures.entry(hash).or_default().push(BlockSignature {
+            offset,
+            length: read_len,
+        });
+        offset += read_len as u64;
+    }
+
+    Ok(signatures)
+}
+
+fn sha256_chunk(chunk: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(chunk);
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn temp_output_path(destination: &Path) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    destination.with_extension(format!("carsync.tmp.{pid}.{now}"))
 }

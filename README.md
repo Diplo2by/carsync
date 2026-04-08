@@ -11,6 +11,7 @@ CarSync - rsync with cars!
 - Progress bars with cat-themed messages
 - Memory-mapped I/O for large files
 - Optional compression for transfer-heavy workloads
+- Delta transfer mode for changed files
 
 ## Installation
 
@@ -42,6 +43,7 @@ carsync -r /source/path /destination/path
 - `-n, --dry-run` - Just stalk, don't pounce (preview mode)
 - `-v, --verbose` - Meow loudly about what's happening
 - `-c, --checksum` - Compare files by checksum (sniff carefully)
+- `-d, --delta` - Use delta transfer for changed files (only changed chunks hitch a ride)
 - `-z, --compress` - Compress file data during transfer
 - `--compression-level <LEVEL>` - Compression level for `--compress` (`-7` to `22`, default `3`)
 - `--delete` - Delete files that don't belong (knock them off the table)
@@ -64,6 +66,12 @@ Sync with checksum verification:
 
 ```bash
 carsync -r -c ~/Projects ~/Backup/Projects
+```
+
+Sync with delta transfer (only changed chunks transferred):
+
+```bash
+carsync -r -d ~/Projects ~/Backup/Projects
 ```
 
 Sync and delete extra files in destination:
