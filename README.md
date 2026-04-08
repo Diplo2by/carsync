@@ -10,6 +10,7 @@ CarSync - rsync with cars!
 - Dry-run mode to preview changes
 - Progress bars with cat-themed messages
 - Memory-mapped I/O for large files
+- Optional compression for transfer-heavy workloads
 
 ## Installation
 
@@ -41,6 +42,8 @@ carsync -r /source/path /destination/path
 - `-n, --dry-run` - Just stalk, don't pounce (preview mode)
 - `-v, --verbose` - Meow loudly about what's happening
 - `-c, --checksum` - Compare files by checksum (sniff carefully)
+- `-z, --compress` - Compress file data during transfer
+- `--compression-level <LEVEL>` - Compression level for `--compress` (`-7` to `22`, default `3`)
 - `--delete` - Delete files that don't belong (knock them off the table)
 
 ### Examples
@@ -67,6 +70,18 @@ Sync and delete extra files in destination:
 
 ```bash
 carsync -r --delete ~/Music ~/Backup/Music
+```
+
+Sync with compression enabled:
+
+```bash
+carsync -r -z ~/Data ~/Backup/Data
+```
+
+Sync with a custom compression level:
+
+```bash
+carsync -r -z --compression-level 8 ~/Data ~/Backup/Data
 ```
 
 ## License
