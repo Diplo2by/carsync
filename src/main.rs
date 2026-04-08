@@ -1,7 +1,9 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::Command,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -124,9 +126,21 @@ impl SyncStats {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let source_raw = args.source.to_string_lossy().to_string();
+    let destination_raw = args.destination.to_string_lossy().to_string();
+    let source_remote = parse_remote_endpoint(&source_raw);
+    let destination_remote = parse_remote_endpoint(&destination_raw);
 
     println!("CarSync - rsync with cars!");
     println!("==========================\n");
+
+    if source_remote.is_some() && destination_remote.is_some() {
+        bail!("Both source and destination are remote. At least one side must be local.")
+    }
+
+    if source_remote.is_some() {
+        bail!("Remote source is not supported yet. Use local source -> remote destination for now.")
+    }
 
     if !args.source.exists() {
         bail!(
@@ -140,7 +154,10 @@ fn main() -> Result<()> {
     }
     let mut stats = SyncStats::new();
 
-    if args.source.is_file() {
+    if let Some(remote) = destination_remote {
+        println!("Remote destination detected - heading out over SSH...\n");
+        sync_to_remote(&args, &remote, &mut stats)?;
+    } else if args.source.is_file() {
         println!("Single file detected - preparing to pounce...\n");
         sync_file(&args, &args.source, &args.destination, &mut stats)?;
     } else if args.source.is_dir() {
@@ -306,6 +323,199 @@ fn sync_directory(args: &Args, stats: &mut SyncStats) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct RemoteEndpoint {
+    host: String,
+    path: String,
+}
+
+fn parse_remote_endpoint(raw: &str) -> Option<RemoteEndpoint> {
+    let (host, path) = raw.split_once(':')?;
+    if host.is_empty() || path.is_empty() || !host.contains('@') || host.contains('/') {
+        return None;
+    }
+    Some(RemoteEndpoint {
+        host: host.to_string(),
+        path: path.to_string(),
+    })
+}
+
+fn sync_to_remote(args: &Args, remote: &RemoteEndpoint, stats: &mut SyncStats) -> Result<()> {
+    if args.delta {
+        println!("Note: --delta is currently local-only, so remote sync uses whole-file transfer.");
+    }
+
+    if args.source.is_file() {
+        sync_file_to_remote(args, &args.source, remote, &remote.path, stats)?;
+    } else if args.source.is_dir() {
+        if !args.recursive {
+            bail!("That's a whole directory! Use -r / --recursive to crawl through it")
+        }
+        sync_directory_to_remote(args, remote, stats)?;
+    }
+    Ok(())
+}
+
+fn sync_file_to_remote(
+    args: &Args,
+    source: &Path,
+    remote: &RemoteEndpoint,
+    remote_destination: &str,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    if !args.dry_run {
+        ensure_remote_parent_dir(remote, remote_destination)?;
+    }
+
+    let should_copy = if !remote_file_exists(remote, remote_destination)? {
+        if args.verbose {
+            println!("New remote file spotted: {} - pouncing!", source.display());
+        }
+        true
+    } else if args.checksum {
+        let matches = !remote_checksums_match(source, remote, remote_destination)?;
+        if matches && args.verbose {
+            println!("Sniffed difference in: {} - re-copying!", source.display());
+        }
+        matches
+    } else {
+        let matches = !remote_metadata_match(source, remote, remote_destination)?;
+        if matches && args.verbose {
+            println!("File changed: {} - updating!", source.display());
+        }
+        matches
+    };
+
+    if should_copy {
+        if !args.dry_run {
+            let size = fs::metadata(source)?.len();
+            copy_file_to_remote(source, remote, remote_destination, args.compress)?;
+            stats.files_copied += 1;
+            stats.bytes_transferred += size;
+            stats.bytes_on_wire += size;
+        }
+    } else {
+        stats.files_skipped += 1;
+    }
+
+    Ok(())
+}
+
+fn sync_directory_to_remote(
+    args: &Args,
+    remote: &RemoteEndpoint,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let source_files: Vec<PathBuf> = WalkDir::new(&args.source)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    println!("Found {} files to inspect", source_files.len());
+
+    if !args.dry_run {
+        let mut dirs: HashSet<String> = HashSet::new();
+        dirs.insert(remote.path.clone());
+        for source_file in &source_files {
+            let relative = source_file.strip_prefix(&args.source)?;
+            if let Some(parent) = relative.parent() {
+                dirs.insert(remote_join_path(&remote.path, parent));
+            }
+        }
+
+        for dir in dirs {
+            ensure_remote_dir(remote, &dir)?;
+        }
+    }
+
+    let pb = ProgressBar::new(source_files.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{bar:40.cyan/blue}] {pos}/{len} files | {msg}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    pb.set_message("*stalking files*");
+
+    for source_file in source_files {
+        let relative_path = source_file.strip_prefix(&args.source)?;
+        let remote_destination = remote_join_path(&remote.path, relative_path);
+        let mut local_stats = SyncStats::new();
+
+        let should_copy = if !remote_file_exists(remote, &remote_destination)? {
+            true
+        } else if args.checksum {
+            !remote_checksums_match(&source_file, remote, &remote_destination)?
+        } else {
+            !remote_metadata_match(&source_file, remote, &remote_destination)?
+        };
+
+        if should_copy {
+            if args.verbose {
+                pb.println(format!("Pouncing on: {}", relative_path.display()));
+            }
+            if !args.dry_run {
+                let size = fs::metadata(&source_file)?.len();
+                copy_file_to_remote(&source_file, remote, &remote_destination, args.compress)?;
+                local_stats.files_copied += 1;
+                local_stats.bytes_transferred += size;
+                local_stats.bytes_on_wire += size;
+                pb.set_message("*carrying files in mouth*");
+            }
+        } else {
+            local_stats.files_skipped += 1;
+        }
+
+        stats.merge(&local_stats);
+        pb.inc(1);
+    }
+
+    pb.set_message("*licking paws*");
+    pb.finish_with_message("Done prowling!");
+
+    if args.delete {
+        println!("\nLooking for files to knock off the remote table...");
+        delete_extra_remote_files(args, remote, stats)?;
+    }
+
+    Ok(())
+}
+
+fn delete_extra_remote_files(
+    args: &Args,
+    remote: &RemoteEndpoint,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let output = run_ssh(
+        remote,
+        &format!("find {} -type f", shell_quote(&remote.path)),
+    )?;
+
+    for line in output.lines() {
+        let remote_file = line.trim();
+        if remote_file.is_empty() {
+            continue;
+        }
+        let Some(relative) = remote_relative_path(&remote.path, remote_file) else {
+            continue;
+        };
+        let source_file = args.source.join(relative);
+        if !source_file.exists() {
+            if args.verbose || args.dry_run {
+                println!("Knocking off remote table: {}", remote_file);
+            }
+            if !args.dry_run {
+                run_ssh(remote, &format!("rm -f {}", shell_quote(remote_file)))?;
+                stats.files_deleted += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn delete_extra_files(args: &Args, stats: &mut SyncStats) -> Result<()> {
     let dest_files: Vec<PathBuf> = WalkDir::new(&args.destination)
         .into_iter()
@@ -331,6 +541,151 @@ fn delete_extra_files(args: &Args, stats: &mut SyncStats) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn remote_file_exists(remote: &RemoteEndpoint, remote_path: &str) -> Result<bool> {
+    let status = Command::new("ssh")
+        .arg(&remote.host)
+        .arg(format!("test -f {}", shell_quote(remote_path)))
+        .status()
+        .context("Failed to run ssh for remote file existence check")?;
+    Ok(status.success())
+}
+
+fn remote_metadata_match(
+    source: &Path,
+    remote: &RemoteEndpoint,
+    remote_path: &str,
+) -> Result<bool> {
+    let source_meta = fs::metadata(source)?;
+    let output = run_ssh(
+        remote,
+        &format!("stat -c '%s %Y' {}", shell_quote(remote_path)),
+    )?;
+    let mut parts = output.trim().split_whitespace();
+    let Some(size_str) = parts.next() else {
+        return Ok(false);
+    };
+    let Some(modified_str) = parts.next() else {
+        return Ok(false);
+    };
+
+    let remote_size: u64 = size_str
+        .parse()
+        .context("Invalid remote size from stat output")?;
+    if source_meta.len() != remote_size {
+        return Ok(false);
+    }
+
+    let remote_modified_secs: u64 = modified_str
+        .parse()
+        .context("Invalid remote modified time from stat output")?;
+    let source_modified_secs = source_meta
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    Ok(source_modified_secs <= remote_modified_secs)
+}
+
+fn remote_checksums_match(
+    source: &Path,
+    remote: &RemoteEndpoint,
+    remote_path: &str,
+) -> Result<bool> {
+    let source_hash = calculate_checksum(source)?;
+    let output = run_ssh(remote, &format!("sha256sum {}", shell_quote(remote_path)))?;
+    let Some(remote_hex) = output.split_whitespace().next() else {
+        return Ok(false);
+    };
+    let remote_hash = hex_to_bytes(remote_hex)?;
+    Ok(source_hash == remote_hash)
+}
+
+fn copy_file_to_remote(
+    source: &Path,
+    remote: &RemoteEndpoint,
+    remote_path: &str,
+    compress_over_ssh: bool,
+) -> Result<()> {
+    let destination = format!("{}:{}", remote.host, shell_quote(remote_path));
+    let mut cmd = Command::new("scp");
+    if compress_over_ssh {
+        cmd.arg("-C");
+    }
+    let status = cmd
+        .arg(source)
+        .arg(destination)
+        .status()
+        .context("Failed to run scp")?;
+
+    if !status.success() {
+        bail!("scp failed for {}", source.display());
+    }
+    Ok(())
+}
+
+fn ensure_remote_parent_dir(remote: &RemoteEndpoint, remote_path: &str) -> Result<()> {
+    let parent = Path::new(remote_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    ensure_remote_dir(remote, &parent)
+}
+
+fn ensure_remote_dir(remote: &RemoteEndpoint, remote_dir: &str) -> Result<()> {
+    run_ssh(remote, &format!("mkdir -p {}", shell_quote(remote_dir))).map(|_| ())
+}
+
+fn remote_join_path(base: &str, relative: &Path) -> String {
+    let rel = relative.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() {
+        return base.to_string();
+    }
+    if base.ends_with('/') {
+        format!("{base}{rel}")
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+fn remote_relative_path<'a>(base: &'a str, full: &'a str) -> Option<&'a str> {
+    if let Some(stripped) = full.strip_prefix(base) {
+        return Some(stripped.trim_start_matches('/'));
+    }
+    None
+}
+
+fn run_ssh(remote: &RemoteEndpoint, remote_command: &str) -> Result<String> {
+    let output = Command::new("ssh")
+        .arg(&remote.host)
+        .arg(remote_command)
+        .output()
+        .context("Failed to run ssh")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("ssh command failed on {}: {}", remote.host, stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        bail!("Invalid hex string length");
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16).context("Invalid hex digit")?;
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 fn metadata_match(source: &Path, destination: &Path) -> Result<bool> {

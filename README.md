@@ -12,6 +12,7 @@ CarSync - rsync with cars!
 - Memory-mapped I/O for large files
 - Optional compression for transfer-heavy workloads
 - Delta transfer mode for changed files
+- Local to remote sync over SSH (`user@host:/path`)
 
 ## Installation
 
@@ -90,6 +91,18 @@ Sync with a custom compression level:
 
 ```bash
 carsync -r -z --compression-level 8 ~/Data ~/Backup/Data
+```
+
+Sync to a remote server over SSH:
+
+```bash
+carsync -r ~/Data user@server:/backups/Data
+```
+
+Sync to remote with SSH compression and checksum compare:
+
+```bash
+carsync -r -z -c ~/Projects user@server:/backups/Projects
 ```
 
 ## License
